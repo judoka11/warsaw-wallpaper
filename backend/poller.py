@@ -52,6 +52,7 @@ def _parse(record: dict, kind: str, now: datetime) -> dict | None:
         "heading": None,
         "stalled": False,
         "at_terminus": False,
+        "direction": None,
     }
 
 
@@ -74,8 +75,9 @@ class Poller:
         self._by_type: dict[str, list[dict]] = {kind: [] for kind in TYPES.values()}
         self._tracks: dict[str, checks.Track] = {}
         self.updated: str | None = None
-        # set from main once GTFS is loaded; stalled/bunching checks wait for it
+        # set from main once GTFS is loaded; the checks that need them wait until then
         self.termini: checks.Termini | None = None
+        self.route_index: checks.RouteIndex | None = None
         self.bunches: list[dict] = []
 
     @property
@@ -97,6 +99,8 @@ class Poller:
             if self.termini:
                 v["stalled"] = checks.is_stalled(track, self.termini)
                 v["at_terminus"] = self.termini.near(v["lat"], v["lon"])
+            if self.route_index and v["heading"] is not None:
+                v["direction"] = self.route_index.direction(v["line"], v["lat"], v["lon"], v["heading"])
         self.bunches = checks.find_bunches(vehicles, self.termini) if self.termini else []
 
         live = {v["id"] for v in vehicles}

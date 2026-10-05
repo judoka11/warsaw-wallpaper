@@ -24,6 +24,9 @@ def load_gtfs_data() -> None:
     points = routes.load_termini()
     if points:
         poller.termini = checks.Termini(points)
+    features = routes.load_routes()
+    if features:
+        poller.route_index = checks.RouteIndex(features)
     metro_timetable = routes.load_metro()
 
 
@@ -34,7 +37,8 @@ async def refresh_routes() -> None:
                 log.info("Building routes from GTFS...")
                 count = await asyncio.to_thread(routes.build_routes)
                 log.info("Routes ready: %d shapes", count)
-                load_gtfs_data()
+                # building the route index takes a few seconds, keep it off the event loop
+                await asyncio.to_thread(load_gtfs_data)
             except Exception:
                 log.exception("Building routes failed, will retry")
                 await asyncio.sleep(300)
@@ -72,6 +76,9 @@ def vehicles():
                     "type": v["type"],
                     "vehicle": v["vehicle"],
                     "speed": v["speed"],
+                    "heading": v["heading"],
+                    "direction": v["direction"],
+                    "at_terminus": v["at_terminus"],
                     "stalled": v["stalled"],
                 },
                 "geometry": {"type": "Point", "coordinates": [v["lon"], v["lat"]]},
@@ -104,6 +111,7 @@ def stats():
         "total": len(current),
         "counts": checks.line_counts(current),
         "speeds": checks.line_speeds(current),
+        "directions": checks.line_directions(current),
         "stalled": [{"line": v["line"], "lat": v["lat"], "lon": v["lon"]} for v in current if v["stalled"]],
         "bunches": poller.bunches,
     }

@@ -35,6 +35,12 @@ def load_termini() -> list[list[float]]:
     return json.loads(TERMINI_FILE.read_text())
 
 
+def load_routes() -> list[dict]:
+    if not ROUTES_FILE.exists():
+        return []
+    return json.loads(ROUTES_FILE.read_text())["features"]
+
+
 def load_metro() -> dict | None:
     if not METRO_FILE.exists():
         return None

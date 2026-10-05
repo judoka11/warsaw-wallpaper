@@ -94,7 +94,7 @@ const METRES = 40075016.686 * Math.cos(52.23 * Math.PI / 180);
 let stats = { counts: {}, speeds: {}, stalled: [], bunches: [] };
 // today's metro departures, and what the timetable says is running right now
 let metro = { dayStart: null, trips: [] };
-let metroNow = { counts: {}, speeds: {} };
+let metroNow = { counts: {}, speeds: {}, directions: {} };
 // one per bus/tram route: { line, type, points, lengths, total, particles }
 let flows = [];
 // line -> ids of its route features (generateId numbers them in file order)
@@ -215,12 +215,24 @@ function buildFlows(features) {
   }
 }
 
-function syncFlows(counts, now) {
+// vehicles and average speed for one direction of a line. Vehicles that couldn't be placed
+// in a direction are shared out evenly, and a direction with no speed uses the line's.
+function flowNumbers(flow) {
+  const source = flow.type === 'metro' ? metroNow : stats;
+  const routes = lineFeatures.get(flow.line)?.length || 1;
+  const line = source.directions?.[flow.line];
+  const direction = line?.directions[flow.direction];
+  const count = line
+    ? (direction?.count || 0) + line.unassigned / routes
+    : (source.counts[flow.line] || 0) / routes;
+  const speed = direction?.speed ?? source.speeds[flow.line] ?? UNKNOWN_SPEED;
+  return { count, speed };
+}
+
+function syncFlows(now) {
   for (const flow of flows) {
-    // a line's vehicles are split between its routes, usually one per direction
-    const routes = lineFeatures.get(flow.line)?.length || 1;
     const perVehicle = FLOW_STYLE[styleOf(flow)]?.perVehicle ?? 0.5;
-    const want = Math.round((counts[flow.line] || 0) * perVehicle / routes);
+    const want = Math.round(flowNumbers(flow).count * perVehicle);
     const alive = flow.particles.filter((p) => !p.dies);
     for (let k = alive.length; k < want; k++) {
       flow.particles.push({ d: Math.random() * flow.total, i: 1, born: now, dies: 0 });
@@ -250,7 +262,7 @@ function drawFlows(ctx, now, { scale, dx, dy }) {
     const key = styleOf(flow);
     const style = FLOW_STYLE[key];
     if (!style || !flow.particles.length || flow.total < style.tail) continue;
-    const speed = stats.speeds[flow.line] ?? metroNow.speeds[flow.line] ?? UNKNOWN_SPEED;
+    const { speed } = flowNumbers(flow);
     const step = speed / 3.6 * FLOW_SPEEDUP * elapsed / 1000;
     flow.particles = flow.particles.filter((p) => !p.dies || p.dies > now);
     for (const p of flow.particles) {
@@ -309,25 +321,33 @@ function tripProgress(stops, t) {
   return [f0 + rate * Math.max(0, t - t0), rate];
 }
 
-// counts the metro trains the timetable says are running now, and their average speed
+// counts the metro trains the timetable says are running now, and their average speed,
+// in the same shape as the bus/tram numbers from /api/stats
 function updateMetro() {
   if (!metro.dayStart) return;
   const now = (Date.now() - metro.dayStart) / 1000;
-  const counts = {};
-  const speedSums = {};
+  const directions = {};
   for (const trip of metro.trips) {
     const duration = trip.stops[trip.stops.length - 1][0];
     for (const departure of trip.departures) {
       const t = now - departure;
       if (t < 0 || t > duration) continue;
       const [, rate] = tripProgress(trip.stops, t);
-      counts[trip.line] = (counts[trip.line] || 0) + 1;
-      speedSums[trip.line] = (speedSums[trip.line] || 0) + rate * trip.flow.total * 3.6;
+      const line = directions[trip.line] || (directions[trip.line] = { unassigned: 0, directions: {} });
+      const dir = line.directions[trip.direction] || (line.directions[trip.direction] = { count: 0, speed: 0 });
+      dir.count += 1;
+      dir.speed += rate * trip.flow.total * 3.6;
     }
   }
-  const speeds = {};
-  for (const line of Object.keys(counts)) speeds[line] = speedSums[line] / counts[line];
-  metroNow = { counts, speeds };
+  const counts = {};
+  for (const [name, line] of Object.entries(directions)) {
+    counts[name] = 0;
+    for (const dir of Object.values(line.directions)) {
+      counts[name] += dir.count;
+      dir.speed /= dir.count;
+    }
+  }
+  metroNow = { counts, speeds: {}, directions };
 }
 
 function ring(path, point, radius, { scale, dx, dy }) {
@@ -387,7 +407,7 @@ async function loadRoutes() {
       shownStates = {};
       setLineStates(stats);
       buildFlows(routes.features);
-      syncFlows(allCounts(), performance.now());
+      syncFlows(performance.now());
       loadMetro();
       return;
     }
@@ -396,14 +416,13 @@ async function loadRoutes() {
   setTimeout(loadRoutes, 15000);
 }
 
-const allCounts = () => ({ ...stats.counts, ...metroNow.counts });
 
 async function refresh() {
   try {
     stats = await (await fetch('/api/stats')).json();
     setLineStates(stats);
     updateMetro();
-    syncFlows(allCounts(), performance.now());
+    syncFlows(performance.now());
   } catch (e) { /* keep showing the last data */ }
   // a new day means a new set of departures
   if (metro.dayStart && Date.now() - metro.dayStart > DAY_MS) loadMetro();
@@ -419,7 +438,7 @@ async function loadMetro() {
     }
     metro = { dayStart: data.day_start, trips };
     updateMetro();
-    syncFlows(allCounts(), performance.now());
+    syncFlows(performance.now());
   } catch (e) { /* no timetable yet, the metro just stays still */ }
 }
 </script>

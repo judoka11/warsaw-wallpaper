@@ -20,6 +20,9 @@ STALL_RADIUS_M = 40
 BUNCH_DISTANCE_M = 300
 BUNCH_HEADING_DEG = 60
 TERMINUS_RADIUS_M = 300
+# a vehicle is on a direction's route if it's this close to it and heading roughly its way
+ROUTE_MAX_M = 150
+ROUTE_HEADING_DEG = 90
 
 EARTH_RADIUS_M = 6371000
 
@@ -54,6 +57,94 @@ class Termini:
             for c in (col - 1, col, col + 1)
             for t_lat, t_lon in self._cells.get((r, c), ())
         )
+
+
+def _angle(a: float, b: float) -> float:
+    return abs((a - b + 180) % 360 - 180)
+
+
+class RouteIndex:
+    """Route shapes cut into segments and bucketed into a grid, to tell which direction
+    of its line a vehicle is driving."""
+
+    CELL_M = 250
+    STEP_M = 100
+    # metres per degree around Warsaw, plenty for comparing nearby points
+    M_PER_LAT = 111_200
+    M_PER_LON = 111_200 * math.cos(math.radians(52.23))
+
+    def __init__(self, features: list[dict]) -> None:
+        # line -> cell -> [(direction, ax, ay, bx, by, bearing)]
+        self._lines: dict[str, dict[tuple[int, int], list]] = defaultdict(lambda: defaultdict(list))
+        for f in features:
+            props = f["properties"]
+            if props["type"] == "metro":
+                continue
+            cells = self._lines[props["line"]]
+            points = [self._xy(lat, lon) for lon, lat in f["geometry"]["coordinates"]]
+            for (ax, ay), (bx, by) in zip(points, points[1:]):
+                length = math.hypot(bx - ax, by - ay)
+                if length == 0:
+                    continue
+                segment = (props["direction"], ax, ay, bx, by, math.degrees(math.atan2(bx - ax, by - ay)) % 360)
+                # file the segment under every cell it passes through
+                steps = int(length // self.STEP_M) + 1
+                for cell in {self._cell(ax + (bx - ax) * k / steps, ay + (by - ay) * k / steps) for k in range(steps + 1)}:
+                    cells[cell].append(segment)
+
+    def _xy(self, lat: float, lon: float) -> tuple[float, float]:
+        return lon * self.M_PER_LON, lat * self.M_PER_LAT
+
+    def _cell(self, x: float, y: float) -> tuple[int, int]:
+        return int(x // self.CELL_M), int(y // self.CELL_M)
+
+    def direction(self, line: str, lat: float, lon: float, heading: float) -> str | None:
+        cells = self._lines.get(line)
+        if not cells:
+            return None
+        x, y = self._xy(lat, lon)
+        cx, cy = self._cell(x, y)
+        best = None
+        for c in ((cx + i, cy + j) for i in (-1, 0, 1) for j in (-1, 0, 1)):
+            for direction, ax, ay, bx, by, bearing in cells.get(c, ()):
+                if _angle(heading, bearing) > ROUTE_HEADING_DEG:
+                    continue
+                # distance from the vehicle to the segment
+                dx, dy = bx - ax, by - ay
+                t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)))
+                distance = math.hypot(x - ax - t * dx, y - ay - t * dy)
+                if distance <= ROUTE_MAX_M and (best is None or distance < best[0]):
+                    best = (distance, direction)
+        return best[1] if best else None
+
+
+def line_directions(vehicles: list[dict]) -> dict[str, dict]:
+    """Per line: vehicles and average speed for each direction, plus how many we
+    couldn't place (no heading yet, or off their usual route)."""
+    counts: dict[str, Counter] = defaultdict(Counter)
+    speeds: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    unassigned: Counter = Counter()
+    for v in vehicles:
+        line, direction = v["line"], v["direction"]
+        if direction is None:
+            unassigned[line] += 1
+            continue
+        counts[line][direction] += 1
+        if v["speed"] is not None and not v["at_terminus"]:
+            speeds[line][direction].append(v["speed"])
+    result = {}
+    for line in set(counts) | set(unassigned):
+        result[line] = {
+            "unassigned": unassigned[line],
+            "directions": {
+                direction: {
+                    "count": n,
+                    "speed": round(sum(s) / len(s), 1) if (s := speeds[line][direction]) else None,
+                }
+                for direction, n in counts[line].items()
+            },
+        }
+    return result
 
 
 def line_counts(vehicles: list[dict]) -> dict[str, int]:
@@ -114,7 +205,7 @@ def is_stalled(track: Track, termini: Termini) -> bool:
 
 
 def _same_way(a: float, b: float) -> bool:
-    return abs((a - b + 180) % 360 - 180) <= BUNCH_HEADING_DEG
+    return _angle(a, b) <= BUNCH_HEADING_DEG
 
 
 def find_bunches(vehicles: list[dict], termini: Termini) -> list[dict]:
