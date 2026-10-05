@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warsaw transit</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+  html, body, #map { margin: 0; height: 100%; background: #0b0d12; }
+  canvas.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; transform-origin: 0 0; }
+  #panel {
+    position: absolute; left: 28px; bottom: 28px;
+    font: 12px/1.5 "Segoe UI", system-ui, sans-serif; color: #cbd5e1;
+    background: rgba(11, 13, 18, .7); border: 1px solid rgba(255, 255, 255, .08);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  #legend { margin: 0; padding: 0; list-style: none; }
+  #legend li { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+  #legend i { flex: none; width: 26px; display: flex; justify-content: center; }
+  #legend i::before { content: ""; display: block; width: 26px; height: var(--h, 2px); background: var(--c); border-radius: 2px; }
+  #legend i.wedge::before { height: 7px; border-radius: 0; clip-path: polygon(0 40%, 100% 0, 100% 100%, 0 60%); }
+  #legend i.ring::before { width: 9px; height: 9px; border-radius: 50%; background: none; border: 1.5px solid var(--c); }
+  #legend small { display: block; color: #64748b; font-size: 11px; line-height: 1.2; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<canvas id="overlay" class="overlay"></canvas>
+<div id="panel">
+  <ul id="legend">
+    <li><i style="--c: #ef4444; --h: 4px"></i>Metro M2</li>
+    <li><i style="--c: #3b82f6; --h: 4px"></i>Metro M1</li>
+    <li><i class="wedge" style="--c: linear-gradient(90deg, #7c2d12, #fb923c, #fed7aa)"></i>Tram line</li>
+    <li><i class="wedge" style="--c: linear-gradient(90deg, #0c4a6e, #38bdf8, #bae6fd)"></i><span>Bus line<small>thicker = more vehicles, brighter = faster</small></span></li>
+    <li><i style="--c: linear-gradient(90deg, transparent 55%, #e0f2fe 55%); --h: 2px"></i><span>Flow<small>more streaks = more vehicles, at the line's speed ×60</small></span></li>
+    <li><i class="ring" style="--c: #ef4444"></i><span>Stalled<small>not moved for 5+ min, away from a terminus</small></span></li>
+    <li><i class="ring" style="--c: #e879f9"></i><span>Bunching<small>same line, same way, under 300 m apart</small></span></li>
+  </ul>
+</div>
+<script>
+// ?wallpaper=1 hides the legend and locks the map.
+// The whole city is fitted to the screen unless you pin a view: ?zoom=11&lat=52.23&lon=21.02
+const params = new URLSearchParams(location.search);
+const WALLPAPER = params.has('wallpaper');
+const FIXED_VIEW = params.has('zoom');
+const WARSAW = [[20.85, 52.09], [21.28, 52.37]];
+const FIT = { padding: 24 };
+const REFRESH_MS = 10000;
+const FRAME_MS = 50;
+const PING_MS = 2500;
+const EMPTY = { type: 'FeatureCollection', features: [] };
+const TAU = Math.PI * 2;
+const STALLED_COLOR = '#ef4444';
+const BUNCH_COLOR = '#e879f9';
+
+// [input, value, ...] stops: width by vehicle count, colour and opacity by average km/h
+const LINE_STYLE = {
+  bus: {
+    width: [0, 0.4, 1, 0.8, 5, 1.6, 10, 2.6, 20, 4.5],
+    color: [8, '#0c4a6e', 18, '#38bdf8', 30, '#bae6fd'],
+    opacity: [8, 0.2, 18, 0.55, 30, 1],
+  },
+  tram: {
+    width: [0, 0.5, 1, 1, 5, 1.8, 10, 2.8, 20, 4.5],
+    color: [8, '#7c2d12', 18, '#fb923c', 30, '#fed7aa'],
+    opacity: [8, 0.25, 18, 0.6, 30, 1],
+  },
+};
+const IDLE_OPACITY = 0.06;
+// used until a line has a real speed (right after startup, or everything at a terminus)
+const UNKNOWN_SPEED = 14;
+
+// Streaks running along each route. They aren't individual vehicles: a line gets
+// streaks in proportion to its vehicles, moving at its average speed, sped up a lot
+// because real speed is invisible at city zoom.
+const FLOW_SPEEDUP = 60;
+const FLOW_PER_VEHICLE = 0.5;
+const FLOW_TAIL_M = 320;
+const FLOW_FADE_M = 400;
+const FLOW_FADE_MS = 1000;
+const FLOW_STEPS = 3;
+const FLOW_COLOR = { bus: '#f0f9ff', tram: '#fff7ed' };
+// metres per mercator unit at Warsaw's latitude
+const METRES = 40075016.686 * Math.cos(52.23 * Math.PI / 180);
+
+let stats = { counts: {}, speeds: {}, stalled: [], bunches: [] };
+// one per bus/tram route: { line, type, points, lengths, total, particles }
+let flows = [];
+// line -> ids of its route features (generateId numbers them in file order)
+let lineFeatures = new Map();
+let shownStates = {};
+let lastFrame = 0;
+let lastFlowAt = 0;
+let drawnView = null;
+
+const canvas = document.getElementById('overlay');
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json',
+  ...(FIXED_VIEW
+    ? { center: [Number(params.get('lon')) || 21.02, Number(params.get('lat')) || 52.23], zoom: Number(params.get('zoom')) }
+    : { bounds: WARSAW, fitBoundsOptions: FIT }),
+  interactive: !WALLPAPER,
+  attributionControl: { compact: true },
+  // the overlay maths assumes a flat, north-up map
+  dragRotate: false,
+  pitchWithRotate: false,
+  touchPitch: false,
+});
+map.touchZoomRotate.disableRotation();
+map.keyboard.disableRotation();
+if (WALLPAPER) document.getElementById('panel').hidden = true;
+if (!FIXED_VIEW) map.on('resize', () => map.fitBounds(WARSAW, { ...FIT, animate: false }));
+
+const byType = (type) => ['==', ['get', 'type'], type];
+
+map.on('load', () => {
+  map.addSource('routes', { type: 'geojson', data: EMPTY, generateId: true });
+
+  const line = (id, filter, paint) => map.addLayer({
+    id, type: 'line', source: 'routes', filter,
+    layout: { 'line-join': 'round', 'line-cap': 'round' }, paint,
+  });
+  const count = ['coalesce', ['feature-state', 'count'], 0];
+  const speed = ['coalesce', ['feature-state', 'speed'], UNKNOWN_SPEED];
+  const ramp = (input, stops) => ['interpolate', ['linear'], input, ...stops];
+  for (const [type, style] of Object.entries(LINE_STYLE)) {
+    line(`routes-${type}`, byType(type), {
+      'line-width': ramp(count, style.width),
+      'line-color': ramp(speed, style.color),
+      'line-opacity': ['case', ['==', count, 0], IDLE_OPACITY, ramp(speed, style.opacity)],
+    });
+  }
+  line('routes-metro', byType('metro'), {
+    'line-color': ['match', ['get', 'line'], 'M1', '#3b82f6', 'M2', '#ef4444', '#a3a3a3'],
+    'line-width': 3.5, 'line-opacity': 0.9,
+  });
+
+  fitCanvas();
+  window.addEventListener('resize', fitCanvas);
+  map.on('move', follow);
+  map.on('moveend', () => draw(performance.now()));
+
+  loadRoutes();
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+  requestAnimationFrame(frame);
+});
+
+// only touches lines whose count or speed actually changed
+function setLineStates({ counts, speeds }) {
+  for (const [name, ids] of lineFeatures) {
+    const count = counts[name] || 0;
+    const speed = name in speeds ? Math.round(speeds[name]) : null;
+    const key = `${count}/${speed}`;
+    if (shownStates[name] === key) continue;
+    shownStates[name] = key;
+    for (const id of ids) map.setFeatureState({ source: 'routes', id }, { count, speed });
+  }
+}
+
+const mercator = ([lon, lat]) => [
+  lon / 360 + 0.5,
+  0.5 - Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)) / TAU,
+];
+const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+
+function fitCanvas() {
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = innerWidth * ratio;
+  canvas.height = innerHeight * ratio;
+  canvas.getContext('2d').setTransform(ratio, 0, 0, ratio, 0, 0);
+  draw(performance.now());
+}
+
+// mercator -> screen pixels: x * scale + dx, y * scale + dy
+function view() {
+  const [cx, cy] = mercator(map.getCenter().toArray());
+  const scale = 512 * 2 ** map.getZoom();
+  return { scale, dx: innerWidth / 2 - cx * scale, dy: innerHeight / 2 - cy * scale };
+}
+
+// Redrawing on every move event is too slow, so while the map moves the canvas
+// is just shifted with CSS, and redrawn properly on moveend.
+function follow() {
+  if (!drawnView) return;
+  const { scale, dx, dy } = view();
+  const k = scale / drawnView.scale;
+  canvas.style.transform = `translate(${dx - drawnView.dx * k}px, ${dy - drawnView.dy * k}px) scale(${k})`;
+}
+
+function buildFlows(features) {
+  flows = [];
+  for (const f of features) {
+    const { line, type } = f.properties;
+    if (type !== 'bus' && type !== 'tram') continue;
+    const points = f.geometry.coordinates.map(mercator);
+    const lengths = [0];
+    for (let i = 1; i < points.length; i++) {
+      lengths.push(lengths[i - 1] + Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]) * METRES);
+    }
+    flows.push({ line, type, points, lengths, total: lengths[lengths.length - 1], particles: [] });
+  }
+}
+
+function syncFlows(counts, now) {
+  for (const flow of flows) {
+    // a line's vehicles are split between its routes, usually one per direction
+    const routes = lineFeatures.get(flow.line)?.length || 1;
+    const want = Math.round((counts[flow.line] || 0) * FLOW_PER_VEHICLE / routes);
+    const alive = flow.particles.filter((p) => !p.dies);
+    for (let k = alive.length; k < want; k++) {
+      flow.particles.push({ d: Math.random() * flow.total, i: 1, born: now, dies: 0 });
+    }
+    for (let k = alive.length; k > want; k--) alive[k - 1].dies = now + FLOW_FADE_MS;
+  }
+}
+
+// point `d` metres along a route; `i` is a segment hint so we don't scan from the start
+function along(flow, d, i) {
+  const { points, lengths } = flow;
+  while (i < points.length - 1 && lengths[i] < d) i++;
+  while (i > 1 && lengths[i - 1] > d) i--;
+  const span = lengths[i] - lengths[i - 1];
+  const t = span > 0 ? (d - lengths[i - 1]) / span : 0;
+  return [lerp(points[i - 1], points[i], Math.min(1, Math.max(0, t))), i];
+}
+
+function drawFlows(ctx, now, { scale, dx, dy }) {
+  // capped so streaks don't jump ahead after the tab was in the background
+  const elapsed = Math.min(200, now - lastFlowAt);
+  lastFlowAt = now;
+  const paths = {};
+  for (const type of Object.keys(FLOW_COLOR)) paths[type] = Array.from({ length: FLOW_STEPS }, () => new Path2D());
+
+  for (const flow of flows) {
+    if (!flow.particles.length || flow.total < FLOW_TAIL_M) continue;
+    const speed = stats.speeds[flow.line] ?? UNKNOWN_SPEED;
+    const step = speed / 3.6 * FLOW_SPEEDUP * elapsed / 1000;
+    flow.particles = flow.particles.filter((p) => !p.dies || p.dies > now);
+    for (const p of flow.particles) {
+      p.d += step;
+      if (p.d >= flow.total) {
+        p.d -= flow.total;
+        p.i = 1;
+      }
+      const [head, i] = along(flow, p.d, p.i);
+      p.i = i;
+      const x = head[0] * scale + dx;
+      const y = head[1] * scale + dy;
+      if (x < -20 || y < -20 || x > innerWidth + 20 || y > innerHeight + 20) continue;
+      const [tail] = along(flow, Math.max(0, p.d - FLOW_TAIL_M), i);
+      // fade at the route ends and when added/removed, so nothing pops in or out
+      const alpha = Math.min(
+        1,
+        p.d / FLOW_FADE_M,
+        (flow.total - p.d) / FLOW_FADE_M,
+        (now - p.born) / FLOW_FADE_MS,
+        p.dies ? (p.dies - now) / FLOW_FADE_MS : 1,
+      );
+      if (alpha <= 0) continue;
+      const level = Math.min(FLOW_STEPS - 1, Math.floor(alpha * FLOW_STEPS));
+      const path = paths[flow.type][level];
+      path.moveTo(tail[0] * scale + dx, tail[1] * scale + dy);
+      path.lineTo(x, y);
+    }
+  }
+
+  ctx.lineCap = 'round';
+  for (const [type, levels] of Object.entries(paths)) {
+    ctx.strokeStyle = FLOW_COLOR[type];
+    levels.forEach((path, level) => {
+      const alpha = (level + 1) / FLOW_STEPS;
+      // wide and faint underneath, thin and bright on top: a cheap glow
+      ctx.lineWidth = 6;
+      ctx.globalAlpha = 0.18 * alpha;
+      ctx.stroke(path);
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.95 * alpha;
+      ctx.stroke(path);
+    });
+  }
+}
+
+function ring(path, point, radius, { scale, dx, dy }) {
+  const x = point[0] * scale + dx;
+  const y = point[1] * scale + dy;
+  path.moveTo(x + radius, y);
+  path.arc(x, y, radius, 0, TAU);
+}
+
+function draw(now) {
+  drawnView = view();
+  canvas.style.transform = '';
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, innerWidth, innerHeight);
+  drawFlows(ctx, now, drawnView);
+
+  const stalled = new Path2D();
+  for (const v of stats.stalled) ring(stalled, mercator([v.lon, v.lat]), 6, drawnView);
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = STALLED_COLOR;
+  ctx.globalAlpha = 0.9;
+  ctx.stroke(stalled);
+
+  // bunches get a steady ring plus one pulsing outwards
+  const ping = (now % PING_MS) / PING_MS;
+  const steady = new Path2D();
+  const pulse = new Path2D();
+  for (const b of stats.bunches) {
+    const point = mercator([b.lon, b.lat]);
+    ring(steady, point, 10, drawnView);
+    ring(pulse, point, 10 + 14 * ping, drawnView);
+  }
+  ctx.strokeStyle = BUNCH_COLOR;
+  ctx.stroke(steady);
+  ctx.globalAlpha = 0.9 * (1 - ping);
+  ctx.stroke(pulse);
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - lastFrame < FRAME_MS) return;
+  lastFrame = now;
+  draw(now);
+}
+
+async function loadRoutes() {
+  try {
+    const routes = await (await fetch('/api/routes')).json();
+    if (routes.features.length) {
+      map.getSource('routes').setData(routes);
+      lineFeatures = new Map();
+      routes.features.forEach((f, id) => {
+        const ids = lineFeatures.get(f.properties.line) || [];
+        ids.push(id);
+        lineFeatures.set(f.properties.line, ids);
+      });
+      shownStates = {};
+      setLineStates(stats);
+      buildFlows(routes.features);
+      syncFlows(stats.counts, performance.now());
+      return;
+    }
+  } catch (e) { /* backend not up yet */ }
+  // still building routes from GTFS, try again in a bit
+  setTimeout(loadRoutes, 15000);
+}
+
+async function refresh() {
+  try {
+    stats = await (await fetch('/api/stats')).json();
+    setLineStates(stats);
+    syncFlows(stats.counts, performance.now());
+  } catch (e) { /* keep showing the last data */ }
+}
+</script>
+</body>
+</html>

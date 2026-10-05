@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      # so page edits show up without rebuilding
+      - ./frontend:/app/frontend
+    restart: unless-stopped
