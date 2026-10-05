@@ -26,6 +26,9 @@ ROUTE_TYPES = {"0": "tram", "1": "metro", "3": "bus"}
 def is_stale() -> bool:
     if not all(f.exists() for f in (ROUTES_FILE, TERMINI_FILE, METRO_FILE)):
         return True
+    # metro.json from before stations were added
+    if "stations" not in json.loads(METRO_FILE.read_text()):
+        return True
     return time.time() - ROUTES_FILE.stat().st_mtime > MAX_AGE_SECONDS
 
 
@@ -62,6 +65,8 @@ def _metro_timetable(zf: zipfile.ZipFile, routes: dict, trips: dict) -> dict:
     """The metro is one template trip per line, direction and day type, plus how often it
     repeats (frequencies.txt). Stops are stored as (seconds from departure, share of the route)."""
     stops: dict[str, list] = {trip_id: [] for trip_id in trips}
+    # stop_id -> line, for drawing the stations
+    station_lines: dict[str, str] = {}
     for r in _rows(zf, "stop_times.txt"):
         if r["trip_id"] in stops:
             stops[r["trip_id"]].append((
@@ -70,6 +75,22 @@ def _metro_timetable(zf: zipfile.ZipFile, routes: dict, trips: dict) -> dict:
                 _seconds(r["departure_time"]),
                 float(r["shape_dist_traveled"] or 0),
             ))
+            station_lines[r["stop_id"]] = routes[trips[r["trip_id"]]["route_id"]][0]
+
+    # each station has a platform per direction ("6059M:P1", "6059M:P2"), merge them into one point
+    platforms: dict[tuple[str, str], list] = {}
+    for r in _rows(zf, "stops.txt"):
+        if r["stop_id"] in station_lines:
+            key = (station_lines[r["stop_id"]], r["stop_id"].split(":")[0])
+            platforms.setdefault(key, []).append((float(r["stop_lon"]), float(r["stop_lat"])))
+    stations = [
+        {
+            "line": line,
+            "lon": round(sum(p[0] for p in points) / len(points), 5),
+            "lat": round(sum(p[1] for p in points) / len(points), 5),
+        }
+        for (line, _), points in sorted(platforms.items())
+    ]
 
     windows: dict[str, list] = {trip_id: [] for trip_id in trips}
     for r in _rows(zf, "frequencies.txt"):
@@ -100,7 +121,7 @@ def _metro_timetable(zf: zipfile.ZipFile, routes: dict, trips: dict) -> dict:
             "stops": times,
             "windows": sorted(windows[trip_id]),
         })
-    return {"dates": dates, "trips": timetable}
+    return {"dates": dates, "trips": timetable, "stations": stations}
 
 
 def build_routes() -> int:

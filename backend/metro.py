@@ -32,4 +32,8 @@ def schedule(timetable: dict, now: datetime) -> dict:
                 "departures": departures,
             })
     midnight = datetime.combine(today, time(), tzinfo=now.tzinfo)
-    return {"day_start": int(midnight.timestamp() * 1000), "trips": trips}
+    return {
+        "day_start": int(midnight.timestamp() * 1000),
+        "trips": trips,
+        "stations": timetable.get("stations", []),
+    }

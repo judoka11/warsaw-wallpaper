@@ -29,11 +29,11 @@
 <canvas id="overlay" class="overlay"></canvas>
 <div id="panel">
   <ul id="legend">
-    <li><i style="--c: #ef4444; --h: 4px"></i>Metro M2</li>
-    <li><i style="--c: #3b82f6; --h: 4px"></i><span>Metro M1<small>one glowing streak per train, from the timetable</small></span></li>
-    <li><i class="wedge" style="--c: linear-gradient(90deg, #7c2d12, #fb923c, #fed7aa)"></i>Tram line</li>
+    <li><i style="--c: linear-gradient(#ef4444 0 25%, #0b0d12 25% 75%, #ef4444 75%); --h: 7px"></i>Metro M2</li>
+    <li><i style="--c: linear-gradient(#3b82f6 0 25%, #0b0d12 25% 75%, #3b82f6 75%); --h: 7px"></i><span>Metro M1<small>dots = stations, one comet per train (timetable)</small></span></li>
+    <li><i class="wedge" style="--c: linear-gradient(#0b0d12, #0b0d12) center / 100% 26% no-repeat, linear-gradient(90deg, #7c2d12, #fb923c, #fed7aa)"></i>Tram line</li>
     <li><i class="wedge" style="--c: linear-gradient(90deg, #0c4a6e, #38bdf8, #bae6fd)"></i><span>Bus line<small>thicker = more vehicles, brighter = faster</small></span></li>
-    <li><i style="--c: linear-gradient(90deg, transparent 55%, #e0f2fe 55%); --h: 2px"></i><span>Flow<small>more streaks = more vehicles, at the line's speed ×60</small></span></li>
+    <li><i style="--c: linear-gradient(90deg, transparent 55%, #e0f2fe 55%); --h: 2px"></i><span>Flow<small>bus dashes, paired tram cars, at the line's speed ×60</small></span></li>
     <li><i class="ring" style="--c: #ef4444"></i><span>Stalled<small>not moved for 5+ min, away from a terminus</small></span></li>
     <li><i class="ring" style="--c: #e879f9"></i><span>Bunching<small>same line, same way, under 300 m apart</small></span></li>
   </ul>
@@ -76,13 +76,14 @@ const UNKNOWN_SPEED = 14;
 // because real speed is invisible at city zoom.
 // The metro has no live data, so its streaks come from the timetable: one per scheduled
 // train, at the trains' scheduled speed. They're bigger and glow in the line's colour.
+// Trams are drawn as two short cars with a gap, buses as single dashes.
 const FLOW_SPEEDUP = 60;
 const FLOW_FADE_M = 400;
 const FLOW_FADE_MS = 1000;
 const FLOW_STEPS = 3;
 const FLOW_STYLE = {
   bus: { perVehicle: 0.5, tail: 320, color: '#f0f9ff', glow: '#f0f9ff', glowAlpha: 0.18, width: 2, glowWidth: 6 },
-  tram: { perVehicle: 0.5, tail: 320, color: '#fff7ed', glow: '#fff7ed', glowAlpha: 0.18, width: 2, glowWidth: 6 },
+  tram: { perVehicle: 0.5, tail: 420, cars: 2, gap: 90, cap: 'butt', color: '#fff7ed', glow: '#fff7ed', glowAlpha: 0.12, width: 2.2, glowWidth: 4 },
   M1: { perVehicle: 1, tail: 700, color: '#eff6ff', glow: '#60a5fa', glowAlpha: 0.5, width: 3.5, glowWidth: 12 },
   M2: { perVehicle: 1, tail: 700, color: '#fef2f2', glow: '#f87171', glowAlpha: 0.5, width: 3.5, glowWidth: 12 },
 };
@@ -143,10 +144,29 @@ map.on('load', () => {
       'line-opacity': ['case', ['==', count, 0], IDLE_OPACITY, ramp(speed, style.opacity)],
     });
   }
+  // a dark stripe down the middle of tram lines, reads as rails once the line is wide enough
+  const railWidth = LINE_STYLE.tram.width.map((v, k) => (k % 2 ? v * 0.3 : v));
+  line('routes-tram-rails', byType('tram'), {
+    'line-color': '#0b0d12',
+    'line-width': ramp(count, railWidth),
+    'line-opacity': ['case', ['==', count, 0], 0, 0.75],
+  });
+  // metro as a hollow line: coloured casing, dark core for the train streaks to run in
   line('routes-metro', byType('metro'), {
     'line-color': ['match', ['get', 'line'], 'M1', '#3b82f6', 'M2', '#ef4444', '#a3a3a3'],
-    // a bit dimmer than before so the train streaks stand out on it
-    'line-width': 3.5, 'line-opacity': 0.6,
+    'line-width': 7, 'line-opacity': 0.9,
+  });
+  line('routes-metro-core', byType('metro'), { 'line-color': '#0b0d12', 'line-width': 3, 'line-opacity': 0.9 });
+
+  map.addSource('stations', { type: 'geojson', data: EMPTY });
+  map.addLayer({
+    id: 'stations', type: 'circle', source: 'stations',
+    paint: {
+      'circle-radius': 3.2,
+      'circle-color': '#f8fafc',
+      'circle-stroke-width': 1.5,
+      'circle-stroke-color': ['match', ['get', 'line'], 'M1', '#3b82f6', 'M2', '#ef4444', '#a3a3a3'],
+    },
   });
 
   fitCanvas();
@@ -276,7 +296,6 @@ function drawFlows(ctx, now, { scale, dx, dy }) {
       const x = head[0] * scale + dx;
       const y = head[1] * scale + dy;
       if (x < -20 || y < -20 || x > innerWidth + 20 || y > innerHeight + 20) continue;
-      const [tail] = along(flow, Math.max(0, p.d - style.tail), i);
       // fade at the route ends and when added/removed, so nothing pops in or out
       const alpha = Math.min(
         1,
@@ -288,14 +307,23 @@ function drawFlows(ctx, now, { scale, dx, dy }) {
       if (alpha <= 0) continue;
       const level = Math.min(FLOW_STEPS - 1, Math.floor(alpha * FLOW_STEPS));
       const path = paths[key][level];
-      path.moveTo(tail[0] * scale + dx, tail[1] * scale + dy);
-      path.lineTo(x, y);
+      // a tram is two cars with a gap between them, everything else one piece
+      const pieces = style.cars === 2
+        ? [[p.d - style.tail, p.d - (style.tail + style.gap) / 2], [p.d - (style.tail - style.gap) / 2, p.d]]
+        : [[p.d - style.tail, p.d]];
+      for (const [from, to] of pieces) {
+        if (to <= 0) continue;
+        const [a] = along(flow, Math.max(0, from), i);
+        const [b] = to === p.d ? [head] : along(flow, to, i);
+        path.moveTo(a[0] * scale + dx, a[1] * scale + dy);
+        path.lineTo(b[0] * scale + dx, b[1] * scale + dy);
+      }
     }
   }
 
-  ctx.lineCap = 'round';
   for (const [key, levels] of Object.entries(paths)) {
     const style = FLOW_STYLE[key];
+    ctx.lineCap = style.cap || 'round';
     levels.forEach((path, level) => {
       const alpha = (level + 1) / FLOW_STEPS;
       // wide and faint underneath, thin and bright on top: a cheap glow
@@ -437,6 +465,14 @@ async function loadMetro() {
       if (flow) trips.push({ ...trip, flow });
     }
     metro = { dayStart: data.day_start, trips };
+    map.getSource('stations').setData({
+      type: 'FeatureCollection',
+      features: (data.stations || []).map((s) => ({
+        type: 'Feature',
+        properties: { line: s.line },
+        geometry: { type: 'Point', coordinates: [s.lon, s.lat] },
+      })),
+    });
     updateMetro();
     syncFlows(performance.now());
   } catch (e) { /* no timetable yet, the metro just stays still */ }
