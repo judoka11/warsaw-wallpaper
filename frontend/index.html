@@ -30,7 +30,7 @@
 <div id="panel">
   <ul id="legend">
     <li><i style="--c: #ef4444; --h: 4px"></i>Metro M2</li>
-    <li><i style="--c: #3b82f6; --h: 4px"></i>Metro M1</li>
+    <li><i style="--c: #3b82f6; --h: 4px"></i><span>Metro M1<small>one glowing streak per train, from the timetable</small></span></li>
     <li><i class="wedge" style="--c: linear-gradient(90deg, #7c2d12, #fb923c, #fed7aa)"></i>Tram line</li>
     <li><i class="wedge" style="--c: linear-gradient(90deg, #0c4a6e, #38bdf8, #bae6fd)"></i><span>Bus line<small>thicker = more vehicles, brighter = faster</small></span></li>
     <li><i style="--c: linear-gradient(90deg, transparent 55%, #e0f2fe 55%); --h: 2px"></i><span>Flow<small>more streaks = more vehicles, at the line's speed ×60</small></span></li>
@@ -74,17 +74,27 @@ const UNKNOWN_SPEED = 14;
 // Streaks running along each route. They aren't individual vehicles: a line gets
 // streaks in proportion to its vehicles, moving at its average speed, sped up a lot
 // because real speed is invisible at city zoom.
+// The metro has no live data, so its streaks come from the timetable: one per scheduled
+// train, at the trains' scheduled speed. They're bigger and glow in the line's colour.
 const FLOW_SPEEDUP = 60;
-const FLOW_PER_VEHICLE = 0.5;
-const FLOW_TAIL_M = 320;
 const FLOW_FADE_M = 400;
 const FLOW_FADE_MS = 1000;
 const FLOW_STEPS = 3;
-const FLOW_COLOR = { bus: '#f0f9ff', tram: '#fff7ed' };
+const FLOW_STYLE = {
+  bus: { perVehicle: 0.5, tail: 320, color: '#f0f9ff', glow: '#f0f9ff', glowAlpha: 0.18, width: 2, glowWidth: 6 },
+  tram: { perVehicle: 0.5, tail: 320, color: '#fff7ed', glow: '#fff7ed', glowAlpha: 0.18, width: 2, glowWidth: 6 },
+  M1: { perVehicle: 1, tail: 700, color: '#eff6ff', glow: '#60a5fa', glowAlpha: 0.5, width: 3.5, glowWidth: 12 },
+  M2: { perVehicle: 1, tail: 700, color: '#fef2f2', glow: '#f87171', glowAlpha: 0.5, width: 3.5, glowWidth: 12 },
+};
+const styleOf = (flow) => (flow.type === 'metro' ? flow.line : flow.type);
+const DAY_MS = 86400000;
 // metres per mercator unit at Warsaw's latitude
 const METRES = 40075016.686 * Math.cos(52.23 * Math.PI / 180);
 
 let stats = { counts: {}, speeds: {}, stalled: [], bunches: [] };
+// today's metro departures, and what the timetable says is running right now
+let metro = { dayStart: null, trips: [] };
+let metroNow = { counts: {}, speeds: {} };
 // one per bus/tram route: { line, type, points, lengths, total, particles }
 let flows = [];
 // line -> ids of its route features (generateId numbers them in file order)
@@ -135,7 +145,8 @@ map.on('load', () => {
   }
   line('routes-metro', byType('metro'), {
     'line-color': ['match', ['get', 'line'], 'M1', '#3b82f6', 'M2', '#ef4444', '#a3a3a3'],
-    'line-width': 3.5, 'line-opacity': 0.9,
+    // a bit dimmer than before so the train streaks stand out on it
+    'line-width': 3.5, 'line-opacity': 0.6,
   });
 
   fitCanvas();
@@ -194,14 +205,13 @@ function follow() {
 function buildFlows(features) {
   flows = [];
   for (const f of features) {
-    const { line, type } = f.properties;
-    if (type !== 'bus' && type !== 'tram') continue;
+    const { line, type, direction } = f.properties;
     const points = f.geometry.coordinates.map(mercator);
     const lengths = [0];
     for (let i = 1; i < points.length; i++) {
       lengths.push(lengths[i - 1] + Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]) * METRES);
     }
-    flows.push({ line, type, points, lengths, total: lengths[lengths.length - 1], particles: [] });
+    flows.push({ line, type, direction, points, lengths, total: lengths[lengths.length - 1], particles: [] });
   }
 }
 
@@ -209,7 +219,8 @@ function syncFlows(counts, now) {
   for (const flow of flows) {
     // a line's vehicles are split between its routes, usually one per direction
     const routes = lineFeatures.get(flow.line)?.length || 1;
-    const want = Math.round((counts[flow.line] || 0) * FLOW_PER_VEHICLE / routes);
+    const perVehicle = FLOW_STYLE[styleOf(flow)]?.perVehicle ?? 0.5;
+    const want = Math.round((counts[flow.line] || 0) * perVehicle / routes);
     const alive = flow.particles.filter((p) => !p.dies);
     for (let k = alive.length; k < want; k++) {
       flow.particles.push({ d: Math.random() * flow.total, i: 1, born: now, dies: 0 });
@@ -233,11 +244,13 @@ function drawFlows(ctx, now, { scale, dx, dy }) {
   const elapsed = Math.min(200, now - lastFlowAt);
   lastFlowAt = now;
   const paths = {};
-  for (const type of Object.keys(FLOW_COLOR)) paths[type] = Array.from({ length: FLOW_STEPS }, () => new Path2D());
+  for (const key of Object.keys(FLOW_STYLE)) paths[key] = Array.from({ length: FLOW_STEPS }, () => new Path2D());
 
   for (const flow of flows) {
-    if (!flow.particles.length || flow.total < FLOW_TAIL_M) continue;
-    const speed = stats.speeds[flow.line] ?? UNKNOWN_SPEED;
+    const key = styleOf(flow);
+    const style = FLOW_STYLE[key];
+    if (!style || !flow.particles.length || flow.total < style.tail) continue;
+    const speed = stats.speeds[flow.line] ?? metroNow.speeds[flow.line] ?? UNKNOWN_SPEED;
     const step = speed / 3.6 * FLOW_SPEEDUP * elapsed / 1000;
     flow.particles = flow.particles.filter((p) => !p.dies || p.dies > now);
     for (const p of flow.particles) {
@@ -251,7 +264,7 @@ function drawFlows(ctx, now, { scale, dx, dy }) {
       const x = head[0] * scale + dx;
       const y = head[1] * scale + dy;
       if (x < -20 || y < -20 || x > innerWidth + 20 || y > innerHeight + 20) continue;
-      const [tail] = along(flow, Math.max(0, p.d - FLOW_TAIL_M), i);
+      const [tail] = along(flow, Math.max(0, p.d - style.tail), i);
       // fade at the route ends and when added/removed, so nothing pops in or out
       const alpha = Math.min(
         1,
@@ -262,26 +275,59 @@ function drawFlows(ctx, now, { scale, dx, dy }) {
       );
       if (alpha <= 0) continue;
       const level = Math.min(FLOW_STEPS - 1, Math.floor(alpha * FLOW_STEPS));
-      const path = paths[flow.type][level];
+      const path = paths[key][level];
       path.moveTo(tail[0] * scale + dx, tail[1] * scale + dy);
       path.lineTo(x, y);
     }
   }
 
   ctx.lineCap = 'round';
-  for (const [type, levels] of Object.entries(paths)) {
-    ctx.strokeStyle = FLOW_COLOR[type];
+  for (const [key, levels] of Object.entries(paths)) {
+    const style = FLOW_STYLE[key];
     levels.forEach((path, level) => {
       const alpha = (level + 1) / FLOW_STEPS;
       // wide and faint underneath, thin and bright on top: a cheap glow
-      ctx.lineWidth = 6;
-      ctx.globalAlpha = 0.18 * alpha;
+      ctx.strokeStyle = style.glow;
+      ctx.lineWidth = style.glowWidth;
+      ctx.globalAlpha = style.glowAlpha * alpha;
       ctx.stroke(path);
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = style.color;
+      ctx.lineWidth = style.width;
       ctx.globalAlpha = 0.95 * alpha;
       ctx.stroke(path);
     });
   }
+}
+
+// where a trip is `t` seconds after leaving: [share of the route done, share per second right now]
+function tripProgress(stops, t) {
+  let i = 1;
+  while (i < stops.length - 1 && stops[i][0] < t) i++;
+  const [t0, f0] = stops[i - 1];
+  const [t1, f1] = stops[i];
+  const rate = t1 > t0 ? (f1 - f0) / (t1 - t0) : 0;
+  return [f0 + rate * Math.max(0, t - t0), rate];
+}
+
+// counts the metro trains the timetable says are running now, and their average speed
+function updateMetro() {
+  if (!metro.dayStart) return;
+  const now = (Date.now() - metro.dayStart) / 1000;
+  const counts = {};
+  const speedSums = {};
+  for (const trip of metro.trips) {
+    const duration = trip.stops[trip.stops.length - 1][0];
+    for (const departure of trip.departures) {
+      const t = now - departure;
+      if (t < 0 || t > duration) continue;
+      const [, rate] = tripProgress(trip.stops, t);
+      counts[trip.line] = (counts[trip.line] || 0) + 1;
+      speedSums[trip.line] = (speedSums[trip.line] || 0) + rate * trip.flow.total * 3.6;
+    }
+  }
+  const speeds = {};
+  for (const line of Object.keys(counts)) speeds[line] = speedSums[line] / counts[line];
+  metroNow = { counts, speeds };
 }
 
 function ring(path, point, radius, { scale, dx, dy }) {
@@ -341,7 +387,8 @@ async function loadRoutes() {
       shownStates = {};
       setLineStates(stats);
       buildFlows(routes.features);
-      syncFlows(stats.counts, performance.now());
+      syncFlows(allCounts(), performance.now());
+      loadMetro();
       return;
     }
   } catch (e) { /* backend not up yet */ }
@@ -349,12 +396,31 @@ async function loadRoutes() {
   setTimeout(loadRoutes, 15000);
 }
 
+const allCounts = () => ({ ...stats.counts, ...metroNow.counts });
+
 async function refresh() {
   try {
     stats = await (await fetch('/api/stats')).json();
     setLineStates(stats);
-    syncFlows(stats.counts, performance.now());
+    updateMetro();
+    syncFlows(allCounts(), performance.now());
   } catch (e) { /* keep showing the last data */ }
+  // a new day means a new set of departures
+  if (metro.dayStart && Date.now() - metro.dayStart > DAY_MS) loadMetro();
+}
+
+async function loadMetro() {
+  try {
+    const data = await (await fetch('/api/metro')).json();
+    const trips = [];
+    for (const trip of data.trips) {
+      const flow = flows.find((f) => f.line === trip.line && f.direction === trip.direction);
+      if (flow) trips.push({ ...trip, flow });
+    }
+    metro = { dayStart: data.day_start, trips };
+    updateMetro();
+    syncFlows(allCounts(), performance.now());
+  } catch (e) { /* no timetable yet, the metro just stays still */ }
 }
 </script>
 </body>
