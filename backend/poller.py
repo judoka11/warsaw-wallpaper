@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -11,11 +12,14 @@ from . import checks
 
 log = logging.getLogger("uvicorn.error")
 
-API_URL = "https://api.um.warszawa.pl/api/action/busestrams_get/"
-RESOURCE_ID = "f2e5503e-927d-4ad3-9500-4ab9e55deb59"
+# The old api.um.warszawa.pl was shut down on 21 Oct 2026. The new portal wants a token
+# (a JWT from dane.um.warszawa.pl/pl/key-api) in the Authorization header, and a POST.
+API_URL = "https://dane.um.warszawa.pl/api/action/get_ztm_lokalizacja_pojazdow"
 TYPES = {1: "bus", 2: "tram"}
 
-API_KEY = os.getenv("ZTM_API_KEY", "")
+API_KEY = os.getenv("ZTM_API_KEY", "").strip()
+# old-style keys looked like a UUID, tokens are three dot-separated parts
+OLD_KEY = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$", re.IGNORECASE)
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 # the API happily returns vehicles that stopped reporting hours ago
 MAX_AGE = timedelta(seconds=int(os.getenv("MAX_VEHICLE_AGE_SECONDS", "120")))
@@ -57,15 +61,16 @@ def _parse(record: dict, kind: str, now: datetime) -> dict | None:
 
 
 async def _fetch(client: httpx.AsyncClient, type_id: int, kind: str) -> list[dict]:
-    resp = await client.get(
-        API_URL,
-        params={"resource_id": RESOURCE_ID, "apikey": API_KEY, "type": type_id},
-    )
-    resp.raise_for_status()
-    result = resp.json().get("result")
-    # errors come back as 200 with a string instead of a list
+    # the raw token, no "Bearer " in front
+    resp = await client.post(API_URL, json={"type": type_id}, headers={"Authorization": API_KEY})
+    # every rejected request (bad or expired token included) comes back as the same 500
+    if resp.status_code != 200:
+        raise ApiError(f"HTTP {resp.status_code} {resp.text[:80]} (check the token if this keeps happening)")
+    result = resp.json()
+    if isinstance(result, dict):
+        result = result.get("result")
     if not isinstance(result, list):
-        raise ApiError(str(result))
+        raise ApiError(str(result)[:80])
     now = datetime.now(WARSAW)
     return [v for r in result if (v := _parse(r, kind, now))]
 
@@ -110,6 +115,10 @@ class Poller:
     async def run(self) -> None:
         if not API_KEY:
             log.error("ZTM_API_KEY is not set, nothing to fetch")
+            return
+        if OLD_KEY.match(API_KEY):
+            log.error("ZTM_API_KEY is a key for the old API, which was shut down on 21 Oct 2026. "
+                      "Get a token at https://dane.um.warszawa.pl/pl/key-api and put it in .env")
             return
         async with httpx.AsyncClient(timeout=20) as client:
             while True:

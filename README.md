@@ -12,11 +12,11 @@ It pulls real-time vehicle positions from the city's open data API every 10 seco
 
 Metro has no live data, so M1 and M2 are just static lines.
 
-Data: [Warsaw open data API](https://api.um.warszawa.pl) for positions, [Warsaw GTFS](https://mkuran.pl/gtfs/) for route shapes.
+Data: [Warsaw open data portal](https://dane.um.warszawa.pl) for positions, [Warsaw GTFS](https://mkuran.pl/gtfs/) for route shapes.
 
 ## Running it
 
-You need Docker and a free API key from [api.um.warszawa.pl](https://api.um.warszawa.pl).
+You need Docker and a free token from [dane.um.warszawa.pl/pl/key-api](https://dane.um.warszawa.pl/pl/key-api). (The old api.um.warszawa.pl keys stopped working when that API was shut down in October 2026.)
 
 ```sh
 cp .env.example .env    # put your key in there
@@ -43,4 +43,4 @@ That hides the legend and locks the map. It fits the whole city to your screen b
 - `backend/main.py` FastAPI app: `/api/stats`, `/api/vehicles`, `/api/routes` and the page
 - `frontend/index.html` the page itself, MapLibre plus a canvas for the streaks and rings
 
-The API key only lives in `.env` on the backend, it never reaches the browser or the Docker image.
+The token only lives in `.env` on the backend, it never reaches the browser or the Docker image.
