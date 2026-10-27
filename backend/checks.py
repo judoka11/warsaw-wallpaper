@@ -86,7 +86,13 @@ class RouteIndex:
                 length = math.hypot(bx - ax, by - ay)
                 if length == 0:
                     continue
-                segment = (props["direction"], ax, ay, bx, by, math.degrees(math.atan2(bx - ax, by - ay)) % 360)
+                segment = (
+                    props["direction"], ax, ay, bx, by,
+                    math.degrees(math.atan2(bx - ax, by - ay)) % 360,
+                    # box around the segment, grown by ROUTE_MAX_M: anything outside is too far
+                    min(ax, bx) - ROUTE_MAX_M, max(ax, bx) + ROUTE_MAX_M,
+                    min(ay, by) - ROUTE_MAX_M, max(ay, by) + ROUTE_MAX_M,
+                )
                 # file the segment under every cell it passes through
                 steps = int(length // self.STEP_M) + 1
                 for cell in {self._cell(ax + (bx - ax) * k / steps, ay + (by - ay) * k / steps) for k in range(steps + 1)}:
@@ -106,8 +112,11 @@ class RouteIndex:
         cx, cy = self._cell(x, y)
         best = None
         for c in ((cx + i, cy + j) for i in (-1, 0, 1) for j in (-1, 0, 1)):
-            for direction, ax, ay, bx, by, bearing in cells.get(c, ()):
-                if _angle(heading, bearing) > ROUTE_HEADING_DEG:
+            for direction, ax, ay, bx, by, bearing, x0, x1, y0, y1 in cells.get(c, ()):
+                # cheapest tests first, most segments fail one of them
+                if not (x0 <= x <= x1 and y0 <= y <= y1):
+                    continue
+                if abs((heading - bearing + 180) % 360 - 180) > ROUTE_HEADING_DEG:
                     continue
                 # distance from the vehicle to the segment
                 dx, dy = bx - ax, by - ay

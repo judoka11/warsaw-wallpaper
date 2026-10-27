@@ -79,6 +79,8 @@ class Poller:
     def __init__(self) -> None:
         self._by_type: dict[str, list[dict]] = {kind: [] for kind in TYPES.values()}
         self._tracks: dict[str, checks.Track] = {}
+        # what was worked out from each track last time; only redone when the track changes
+        self._derived: dict[str, tuple] = {}
         self.updated: str | None = None
         # set from main once GTFS is loaded; the checks that need them wait until then
         self.termini: checks.Termini | None = None
@@ -99,6 +101,14 @@ class Poller:
                 track.append(fix)
             while v["seen"] - track[0][0] > HISTORY:
                 track.pop(0)
+
+            # about half the vehicles have no new fix since the last poll, and then
+            # nothing below can have changed either, so reuse the last answers
+            key = (track[0][0], track[-1][0], v["line"], id(self.termini), id(self.route_index))
+            cached = self._derived.get(v["id"])
+            if cached and cached[0] == key:
+                v["speed"], v["heading"], v["stalled"], v["at_terminus"], v["direction"] = cached[1]
+                continue
             v["speed"] = checks.speed_kmh(track)
             v["heading"] = checks.heading(track)
             if self.termini:
@@ -106,11 +116,13 @@ class Poller:
                 v["at_terminus"] = self.termini.near(v["lat"], v["lon"])
             if self.route_index and v["heading"] is not None:
                 v["direction"] = self.route_index.direction(v["line"], v["lat"], v["lon"], v["heading"])
+            self._derived[v["id"]] = (key, (v["speed"], v["heading"], v["stalled"], v["at_terminus"], v["direction"]))
         self.bunches = checks.find_bunches(vehicles, self.termini) if self.termini else []
 
         live = {v["id"] for v in vehicles}
         for vehicle_id in [i for i in self._tracks if i not in live]:
             del self._tracks[vehicle_id]
+            self._derived.pop(vehicle_id, None)
 
     async def run(self) -> None:
         if not API_KEY:
